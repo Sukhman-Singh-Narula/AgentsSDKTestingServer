@@ -4,8 +4,10 @@ from logging import getLogger
 from typing import Any, Dict
 import numpy as np
 from scipy import signal
+from scipy.signal import resample_poly
 import io
 import wave
+import asyncio
 
 from agents import Runner, trace
 from agents.voice import (
@@ -143,21 +145,50 @@ def convert_audio_for_esp32(audio_data: np.ndarray, source_rate: int = 24000, ta
         if audio_data.ndim > 1:
             audio_data = np.mean(audio_data, axis=1)  # Convert to mono
         
-        # Resample if necessary
+        # Resample if necessary with anti-aliasing
         if source_rate != target_rate:
-            # Calculate resampling ratio
-            num_samples = int(len(audio_data) * target_rate / source_rate)
-            audio_data = signal.resample(audio_data, num_samples)
-            print(f"Resampled audio from {source_rate}Hz to {target_rate}Hz")
+            # Use high-quality resampling with anti-aliasing filter
+            from scipy.signal import resample_poly
+            
+            # Calculate rational resampling factors to avoid artifacts
+            gcd_val = np.gcd(source_rate, target_rate)
+            up_factor = target_rate // gcd_val
+            down_factor = source_rate // gcd_val
+            
+            if up_factor != 1 or down_factor != 1:
+                # Apply anti-aliasing filter before resampling
+                nyquist = min(source_rate, target_rate) / 2
+                cutoff = 0.8 * nyquist
+                sos = signal.butter(6, cutoff, btype='low', fs=source_rate, output='sos')
+                audio_data = signal.sosfilt(sos, audio_data)
+                
+                # High-quality rational resampling
+                audio_data = resample_poly(audio_data, up_factor, down_factor)
+                print(f"High-quality resampled audio from {source_rate}Hz to {target_rate}Hz")
+            else:
+                print(f"No resampling needed: {source_rate}Hz")
         
-        # Normalize audio to prevent clipping
-        if np.max(np.abs(audio_data)) > 1.0:
-            audio_data = audio_data / np.max(np.abs(audio_data))
+        # Apply gentle high-pass filter to remove DC offset and low-frequency noise
+        if len(audio_data) > 100:  # Only if we have enough samples
+            sos_hp = signal.butter(2, 80, btype='high', fs=target_rate, output='sos')
+            audio_data = signal.sosfilt(sos_hp, audio_data)
         
-        # Apply slight gain boost for better volume on ESP32
-        audio_data = audio_data * 0.8
+        # Normalize audio with headroom to prevent clipping
+        max_val = np.max(np.abs(audio_data))
+        if max_val > 0:
+            # Normalize to 70% to prevent clipping and distortion
+            audio_data = audio_data / max_val * 0.7
         
-        # Convert to 16-bit PCM
+        # Apply gentle compression to reduce dynamic range
+        audio_data = np.tanh(audio_data * 1.2) * 0.8
+        
+        # Convert to 16-bit PCM with dithering to reduce quantization noise
+        # Add small amount of dither noise
+        dither = np.random.normal(0, 0.5, len(audio_data))
+        audio_data = audio_data + dither / 32768
+        
+        # Clip to valid range and convert to int16
+        audio_data = np.clip(audio_data, -1.0, 1.0)
         audio_int16 = (audio_data * 32767).astype(np.int16)
         
         return audio_int16.tobytes()
@@ -167,6 +198,22 @@ def convert_audio_for_esp32(audio_data: np.ndarray, source_rate: int = 24000, ta
         # Return silence on error
         silence = np.zeros(1024, dtype=np.int16)
         return silence.tobytes()
+
+def chunk_audio_for_esp32(audio_bytes: bytes, chunk_size: int = 1024) -> list:
+    """
+    Break large audio data into ESP32-compatible chunks
+    ESP32 I2S works best with smaller chunks to prevent buffer overflow
+    """
+    chunks = []
+    for i in range(0, len(audio_bytes), chunk_size):
+        chunk = audio_bytes[i:i + chunk_size]
+        # Pad last chunk if necessary to maintain consistent timing
+        if len(chunk) < chunk_size and i + chunk_size >= len(audio_bytes):
+            # Pad with silence (zeros) instead of random data
+            padding = bytes(chunk_size - len(chunk))
+            chunk = chunk + padding
+        chunks.append(chunk)
+    return chunks
 
 def detect_audio_sample_rate(audio_data: np.ndarray) -> int:
     """
@@ -252,6 +299,9 @@ async def esp32_bridge_endpoint(websocket: WebSocket):
                         audio_chunks_sent = 0
                         total_audio_bytes = 0
                         
+                        # Buffer to accumulate audio data before chunking
+                        accumulated_audio = bytearray()
+                        
                         async for event in output.stream():
                             if isinstance(event, VoiceStreamEventAudio):
                                 # Detect sample rate of incoming audio
@@ -265,13 +315,27 @@ async def esp32_bridge_endpoint(websocket: WebSocket):
                                     target_rate=22050  # ESP32 DAC sample rate
                                 )
                                 
-                                # Send converted audio to ESP32
-                                await websocket.send_bytes(esp32_audio_bytes)
+                                # Accumulate audio data
+                                accumulated_audio.extend(esp32_audio_bytes)
+                        
+                        # Now send the accumulated audio in ESP32-compatible chunks
+                        if accumulated_audio:
+                            print(f"Breaking {len(accumulated_audio)} bytes into ESP32-compatible chunks...")
+                            
+                            # Break into 1024-byte chunks (matches ESP32 I2S buffer size)
+                            audio_chunks = chunk_audio_for_esp32(bytes(accumulated_audio), chunk_size=1024)
+                            
+                            print(f"Created {len(audio_chunks)} chunks of 1024 bytes each")
+                            
+                            # Send chunks with small delay to prevent I2S buffer overflow
+                            for i, chunk in enumerate(audio_chunks):
+                                await websocket.send_bytes(chunk)
                                 audio_chunks_sent += 1
-                                total_audio_bytes += len(esp32_audio_bytes)
+                                total_audio_bytes += len(chunk)
                                 
-                                # Log progress every 10 chunks
-                                if audio_chunks_sent % 10 == 0:
+                                # Small delay every 10 chunks to prevent buffer overflow
+                                if i % 10 == 0 and i > 0:
+                                    await asyncio.sleep(0.01)  # 10ms delay
                                     print(f"Sent {audio_chunks_sent} chunks ({total_audio_bytes} bytes) to ESP32")
                         
                         print(f"Audio streaming complete: {audio_chunks_sent} chunks, {total_audio_bytes} bytes total")
@@ -333,4 +397,4 @@ if __name__ == "__main__":
     print("🚀 Starting Voice Agent Server with ESP32 Bridge")
     print("📡 ESP32 endpoint: ws://localhost:8000/upload")
     print("🌐 New clients endpoint: ws://localhost:8000/ws")
-    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("server:app", host="0.0.0.0", port=5000, reload=True)
